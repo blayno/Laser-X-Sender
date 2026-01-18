@@ -7,5 +7,14 @@ IMPORTANT DISCLAIMER: This is my personal project and has only been tested by me
 I am not responsible for any damage, malfunction, or personal injury that may result from the use or misuse of Laser X Sender.
  Use it with caution and at your own discretion.
 
+Python 3.8+ (3.9 or 3.10 recommended)
+
+pip install PyQt5
+
+pip install pyqtgraph
+
+pip install pyserial
+
+
 
 
