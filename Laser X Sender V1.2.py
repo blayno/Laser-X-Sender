@@ -6,6 +6,7 @@ import re
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 from PyQt5.QtMultimedia import QSound  # at the top of your file
+import numpy as np
 
 # -------------------- CNC Sender Thread (Planner-aware GRBL) --------------------
 class SenderThread(QtCore.QThread):
@@ -136,7 +137,10 @@ class CNCSender(QtWidgets.QMainWindow):
 
         self.last_wco = None
         self.last_mpos = None
-
+        
+        self.jog_buttons = []
+        self.zero_buttons = []  # add this for zero buttons
+        
         self.use_real_feedback = True
 
         self._build_ui()
@@ -161,7 +165,7 @@ class CNCSender(QtWidgets.QMainWindow):
         self.load_btn = QtWidgets.QPushButton("Load G-code")
         self.play_btn = QtWidgets.QPushButton("Play")
         self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.play_btn.setEnabled(True)
+        self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
 
         left.addWidget(self.port_box)
@@ -205,16 +209,32 @@ class CNCSender(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
         left.addWidget(self.progress_bar)
 
+        
         # --- Zero Axis ---
         left.addSpacing(10)
         left.addWidget(QtWidgets.QLabel("Zero Axis"))
-        zero = QtWidgets.QGridLayout()
-        left.addLayout(zero)
-        zero.addWidget(self._jog_btn("X0"), 0, 0)
+        zero_layout = QtWidgets.QGridLayout()
+        left.addLayout(zero_layout)
+
+        # Zero buttons
+        zero_x = self._jog_btn("X0")
+        zero_y = self._jog_btn("Y0")
+        
+
+        # Home button
         btn_home = QtWidgets.QPushButton("$Home")
         btn_home.clicked.connect(lambda: self.send_command("$H"))
-        zero.addWidget(btn_home, 0, 1)
-        zero.addWidget(self._jog_btn("Y0"), 0, 2)
+
+        # Add to grid
+        zero_layout.addWidget(zero_x, 0, 0)
+        zero_layout.addWidget(btn_home, 0, 1)
+        zero_layout.addWidget(zero_y, 0, 2)
+
+        # Keep track of zero buttons for UI state management
+        self.zero_buttons.extend([zero_x, zero_y, btn_home])
+
+
+
 
         # --- Jog Buttons ---
         left.addSpacing(10)
@@ -250,10 +270,28 @@ class CNCSender(QtWidgets.QMainWindow):
         self.plot.showGrid(x=True, y=True)
         self.plot.setAspectLocked(True)
         layout.addWidget(self.plot, 1)
-        self.path_item = pg.PlotDataItem(pen=pg.mkPen("c", width=1))
-        self.plot.addItem(self.path_item)
-        self.tool_item = pg.ScatterPlotItem(size=10, brush=pg.mkBrush("r"))
+        
+        self.cut_path = pg.PlotDataItem(
+            pen=pg.mkPen("c", width=2)
+        )
+        self.rapid_path = pg.PlotDataItem(
+            pen=pg.mkPen("y", width=1, style=QtCore.Qt.DashLine)
+        )
+
+        self.cut_path.setZValue(1)
+        self.rapid_path.setZValue(2)   # rapids on top
+
+        self.plot.addItem(self.cut_path)
+        self.plot.addItem(self.rapid_path)
+
+        self.tool_item = pg.ScatterPlotItem(
+            size=12,
+            brush=pg.mkBrush("r"),
+            pen=pg.mkPen("w", width=1)  # white outline helps visibility
+        )
+        self.tool_item.setZValue(10)   # ALWAYS on top
         self.plot.addItem(self.tool_item)
+
 
         # Connect buttons
         self.connect_btn.clicked.connect(self.connect)
@@ -261,6 +299,7 @@ class CNCSender(QtWidgets.QMainWindow):
         self.load_btn.clicked.connect(self.load_gcode)
         self.play_btn.clicked.connect(self.play)
         self.stop_btn.clicked.connect(self.stop)
+        self.update_jog_zero_state()
 
     # ---------------- Jog / Zero / Commands ----------------
     def _jog_btn(self, label):
@@ -269,6 +308,8 @@ class CNCSender(QtWidgets.QMainWindow):
             btn.clicked.connect(lambda _, l=label: self.zero_axis(l[0]))
         else:
             btn.clicked.connect(lambda _, l=label: self.jog(l))
+            
+            self.jog_buttons.append(btn)   # <-- track buttons
         return btn
 
     def jog(self, direction):
@@ -336,6 +377,8 @@ class CNCSender(QtWidgets.QMainWindow):
             self.status_timer.start(200)
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
+            self.play_btn.setEnabled(True)   # <-- enable Play button
+            self.update_jog_zero_state()
         except Exception as e:
             self.log(str(e))
 
@@ -345,9 +388,11 @@ class CNCSender(QtWidgets.QMainWindow):
             self.ser = None
         self.log("Disconnected")
         QSound.play("Assets/disconnected.wav")
+        self.play_btn.setEnabled(False)   # <-- enable Play button
         self.status_timer.stop()
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self.update_jog_zero_state()
 
     def load_gcode(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load G-code", "", "G-code (*.nc *.gcode *.tap *.txt)")
@@ -372,6 +417,7 @@ class CNCSender(QtWidgets.QMainWindow):
         self.sender.progress_signal.connect(self.progress_bar.setValue)  # <-- connect progress
         self.sender.done_signal.connect(self.job_finished)
         self.sender.start()
+        self.update_jog_zero_state()   # disable jog/zero
         
         #========== Progress Timer ================
         self.job_start_time = time.time()
@@ -389,6 +435,7 @@ class CNCSender(QtWidgets.QMainWindow):
         if self.sender:
             self.sender.stop()
         self.log("Stopping...")
+        self.update_jog_zero_state()
 
     # ---------------- Status ----------------
     def parse_status(self, status):
@@ -444,6 +491,9 @@ class CNCSender(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)  # reset progress
         self.progress_timer.stop()  # stop updating ETA/run time
         
+        self.sender = None            # <-- IMPORTANT
+        self.update_jog_zero_state()  # <-- re-enable jogs here
+        
         #=========== ETA Run time =======================
     def update_progress_info(self):
         if not self.sender or not self.gcode_lines:
@@ -470,14 +520,66 @@ class CNCSender(QtWidgets.QMainWindow):
     # ---------------- Plotting ----------------
     def plot_gcode(self):
         x = y = 0.0
-        xs, ys = [0], [0]
+        motion = None
+        laser_power = 0.0
+
+        cut_x, cut_y = [], []
+        rapid_x, rapid_y = [], []
+
         for line in self.gcode_lines:
-            for axis, val in re.findall(r"([XY])([-+]?\d*\.?\d+)", line.upper()):
-                if axis == "X": x = float(val)
-                elif axis == "Y": y = float(val)
-            xs.append(x)
-            ys.append(y)
-        self.path_item.setData(xs, ys)
+            line_u = line.upper()
+
+            # ---- Motion mode (SAFE) ----
+            if re.search(r"\bG0\b|\bG00\b", line_u):
+                motion = "G0"
+            elif re.search(r"\bG1\b|\bG01\b", line_u):
+                motion = "G1"
+
+            # ---- Laser power (modal) ----
+            m = re.search(r"\bS([-+]?\d*\.?\d+)", line_u)
+            if m:
+                laser_power = float(m.group(1))
+
+            # ---- Parse XY ----
+            for axis, val in re.findall(r"([XY])([-+]?\d*\.?\d+)", line_u):
+                if axis == "X":
+                    x = float(val)
+                elif axis == "Y":
+                    y = float(val)
+
+            # ---- Decide path ----
+            laser_on = (motion == "G1") and (laser_power > 0)
+
+            if laser_on:
+                cut_x.append(x)
+                cut_y.append(y)
+                rapid_x.append(np.nan)
+                rapid_y.append(np.nan)
+            else:
+                rapid_x.append(x)
+                rapid_y.append(y)
+                cut_x.append(np.nan)
+                cut_y.append(np.nan)
+
+        self.cut_path.setData(cut_x, cut_y)
+        self.rapid_path.setData(rapid_x, rapid_y)
+        
+#single ui state manager--------------------
+    def update_jog_zero_state(self):
+        enabled = self.ser is not None and (self.sender is None or not self.sender.isRunning())
+
+        # Jog buttons
+        for btn in self.jog_buttons:
+            btn.setEnabled(enabled)
+
+        # Zero buttons
+        for btn in self.zero_buttons:
+            btn.setEnabled(enabled)
+
+
+
+
+
 
     # ---------------- Utility ----------------
     def log(self, msg):
