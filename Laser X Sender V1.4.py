@@ -7,6 +7,7 @@ from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 from PyQt5.QtMultimedia import QSound  # at the top of your file
 import numpy as np
+from PyQt5 import QtGui
 
 # -------------------- CNC Sender Thread (Planner-aware GRBL) --------------------
 class SenderThread(QtCore.QThread):
@@ -14,6 +15,8 @@ class SenderThread(QtCore.QThread):
     tool_signal = QtCore.pyqtSignal(float, float, float)
     done_signal = QtCore.pyqtSignal()
     progress_signal = QtCore.pyqtSignal(int)  # <-- progress signal
+    feed_signal = QtCore.pyqtSignal(float)  # NEW
+    speed_signal = QtCore.pyqtSignal(float) # NEW
 
     RX_BUFFER = 128      # GRBL RX buffer size
     SAFETY = 10          # Safety margin to avoid overflow
@@ -52,18 +55,27 @@ class SenderThread(QtCore.QThread):
                     idx -= 1
                     break
 
-                # Parse X/Y/Z for GUI
+                # ---- Parse positions ----
                 for axis, val in re.findall(r"([XYZ])([-+]?\d*\.?\d+)", raw.upper()):
                     if axis == "X": x = float(val)
                     elif axis == "Y": y = float(val)
                     elif axis == "Z": z = float(val)
 
-                # Emit tool position (throttled)
+                # ---- Parse feed and speed once per line ----
+                m_feed = re.search(r"F([0-9.]+)", raw.upper())
+                if m_feed:
+                    self.feed_signal.emit(float(m_feed.group(1)))
+
+                m_speed = re.search(r"S([0-9.]+)", raw.upper())
+                if m_speed:
+                    self.speed_signal.emit(float(m_speed.group(1)))
+
+                # ---- Emit tool position (throttled) ----
                 if time.time() - last_update > 0.01:
                     self.tool_signal.emit(x, y, z)
                     last_update = time.time()
 
-                # Send to GRBL
+                # ---- Send to GRBL ----
                 sent = False
                 while not sent and not self._stop:
                     try:
@@ -77,11 +89,11 @@ class SenderThread(QtCore.QThread):
                 in_flight.append(size)
                 bytes_in_flight += size
 
-                # Emit progress
+                # ---- Emit progress ----
                 progress = int((idx / len(self.gcode_lines)) * 100)
                 self.progress_signal.emit(progress)
 
-            # Read response from GRBL
+            # ---- Read response from GRBL ----
             try:
                 resp = self.ser.readline().decode(errors="ignore").strip()
                 if resp:
@@ -97,11 +109,12 @@ class SenderThread(QtCore.QThread):
 
             time.sleep(0.001)
 
-        # Final tool update at end
+        # ---- Final update ----
         self.tool_signal.emit(x, y, z)
         self.progress_signal.emit(100)
         self.log_signal.emit("Job complete")
         self.done_signal.emit()
+
 
     def _run_simulation(self):
         x = y = z = 0.0
@@ -122,12 +135,11 @@ class SenderThread(QtCore.QThread):
         self.progress_signal.emit(100)
         self.done_signal.emit()
 
-
 # -------------------- Main Window --------------------
 class CNCSender(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Laser X sender V1.0")
+        self.setWindowTitle("Laser X sender V1.4")
         self.resize(1100, 700)
 
         self.ser = None
@@ -178,9 +190,8 @@ class CNCSender(QtWidgets.QMainWindow):
 
         conn_layout.addWidget(self.connect_btn)
         conn_layout.addWidget(self.disconnect_btn)
-
+        
         left.addLayout(conn_layout)
-
         left.addWidget(self.load_btn)
         
         # Create horizontal layout for Play/Stop
@@ -190,10 +201,6 @@ class CNCSender(QtWidgets.QMainWindow):
 
         # Add the layout to the left panel instead of individual widgets
         left.addLayout(play_layout)
-
-        
-        # left.addSpacing(5)
-        # left.addWidget(QtWidgets.QLabel("Progress Info"))
 
         # Run time and ETA labels
         self.run_time_label = QtWidgets.QLabel("Run Time: 00:00:00")
@@ -208,8 +215,7 @@ class CNCSender(QtWidgets.QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         left.addWidget(self.progress_bar)
-
-        
+       
         # --- Zero Axis ---
         left.addSpacing(10)
         left.addWidget(QtWidgets.QLabel("Zero Axis"))
@@ -233,12 +239,50 @@ class CNCSender(QtWidgets.QMainWindow):
         # Keep track of zero buttons for UI state management
         self.zero_buttons.extend([zero_x, zero_y, btn_home])
 
+        # --- Jog Distance & Speed Sliders ---
+        left.addSpacing(10)
+        left.addWidget(QtWidgets.QLabel("Jog"))
+
+        jog_settings_layout = QtWidgets.QGridLayout()
+        left.addLayout(jog_settings_layout)
+
+        # Distance slider
+        self.jog_distance_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.jog_distance_slider.setMinimum(1)     # 0.1 mm
+        self.jog_distance_slider.setMaximum(1000)  # 100.0 mm
+        self.jog_distance_slider.setValue(100)     # default 10 mm
+        self.jog_distance_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.jog_distance_slider.setTickInterval(50)
+        self.jog_distance_label = QtWidgets.QLabel("Distance: 10.0 mm")
+
+        self.jog_distance_slider.valueChanged.connect(
+            lambda v: self.jog_distance_label.setText(f"Distance: {v / 10:.1f} mm")
+        )
+
+        # Speed slider
+        self.jog_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.jog_speed_slider.setMinimum(1)      # 1 mm/min
+        self.jog_speed_slider.setMaximum(5000)   # 5000 mm/min
+        self.jog_speed_slider.setValue(500)      # default 500 mm/min
+        self.jog_speed_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.jog_speed_slider.setTickInterval(500)
+        self.jog_speed_label = QtWidgets.QLabel("Speed: 500 mm/min")
+
+        self.jog_speed_slider.valueChanged.connect(
+            lambda v: self.jog_speed_label.setText(f"Speed: {v} mm/min")
+        )
+
+        # Add to grid layout
+        jog_settings_layout.addWidget(self.jog_distance_label, 0, 0)
+        jog_settings_layout.addWidget(self.jog_distance_slider, 0, 1)
+        jog_settings_layout.addWidget(self.jog_speed_label, 1, 0)
+        jog_settings_layout.addWidget(self.jog_speed_slider, 1, 1)
 
 
 
         # --- Jog Buttons ---
-        left.addSpacing(10)
-        left.addWidget(QtWidgets.QLabel("Jog"))
+        # left.addSpacing(10)
+        # left.addWidget(QtWidgets.QLabel("Jog"))
         jog = QtWidgets.QGridLayout()
         left.addLayout(jog)
         jog.addWidget(self._jog_btn("Y+"), 1, 1)
@@ -270,7 +314,8 @@ class CNCSender(QtWidgets.QMainWindow):
         self.plot.showGrid(x=True, y=True)
         self.plot.setAspectLocked(True)
         layout.addWidget(self.plot, 1)
-        
+        self._build_visualiser_legend()
+
         self.cut_path = pg.PlotDataItem(
             pen=pg.mkPen("c", width=2)
         )
@@ -315,10 +360,27 @@ class CNCSender(QtWidgets.QMainWindow):
     def jog(self, direction):
         if not self.ser or (self.sender and self.sender.isRunning()):
             return
-        jog_map = {"X+": "G91 G0 X1", "X-": "G91 G0 X-1", "Y+": "G91 G0 Y1", "Y-": "G91 G0 Y-1"}
+
+        dist = self.jog_distance_slider.value() / 10  # 0.1 mm steps
+        speed = self.jog_speed_slider.value()         # mm/min
+
+        # Use G1 for feedrate-aware jog
+        jog_map = {
+            "X+": f"G91 G1 X{dist} F{speed}",
+            "X-": f"G91 G1 X-{dist} F{speed}",
+            "Y+": f"G91 G1 Y{dist} F{speed}",
+            "Y-": f"G91 G1 Y-{dist} F{speed}"
+        }
         cmd = jog_map[direction] + "\nG90\n"
-        self.ser.write(cmd.encode())
-        self.log(f"Jog {direction}")
+        try:
+            self.ser.write(cmd.encode())
+            self.log(f"Jog {direction} Dist:{dist} Speed:{speed}")
+            self.feed_label.setText(f"F:{speed:.0f}")  # <-- update feed label immediately
+        except serial.SerialException as e:
+            self.log(f"Jog error: {e}")
+
+
+
 
     def zero_axis(self, axis):
         if not self.ser:
@@ -326,15 +388,12 @@ class CNCSender(QtWidgets.QMainWindow):
         axis = axis.upper()
         try:
             self.ser.write(f"G10 L20 P1 {axis}0\n".encode())
-            time.sleep(0.02)
-            self.ser.write(b"?")
-            time.sleep(0.02)
-            resp = self.ser.readline().decode(errors="ignore").strip()
-            if resp.startswith("<"):
-                self.parse_status(resp)
             self.log(f"Axis {axis} zeroed")
+            # Immediately ask GRBL for status (non-blocking)
+            self.ser.write(b"?")
         except Exception as e:
             self.log(f"Error zeroing axis {axis}: {e}")
+
 
     def send_manual_command(self):
         if not self.ser:
@@ -374,7 +433,7 @@ class CNCSender(QtWidgets.QMainWindow):
             self.ser.reset_input_buffer()
             self.log("Connected")
             QSound.play("Assets/connected.wav")
-            self.status_timer.start(200)
+            self.status_timer.start(50) #milliseconds
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
             self.play_btn.setEnabled(True)   # <-- enable Play button
@@ -416,6 +475,8 @@ class CNCSender(QtWidgets.QMainWindow):
         self.sender.tool_signal.connect(self.update_tool_position)
         self.sender.progress_signal.connect(self.progress_bar.setValue)  # <-- connect progress
         self.sender.done_signal.connect(self.job_finished)
+        self.sender.feed_signal.connect(lambda f: self.feed_label.setText(f"F:{f:.0f}"))
+        self.sender.speed_signal.connect(lambda s: self.speed_label.setText(f"S:{s:.0f}"))
         self.sender.start()
         self.update_jog_zero_state()   # disable jog/zero
         
@@ -424,7 +485,6 @@ class CNCSender(QtWidgets.QMainWindow):
         self.progress_timer = QtCore.QTimer()
         self.progress_timer.timeout.connect(self.update_progress_info)
         self.progress_timer.start(200)  # update every 200ms
-
 
     def stop(self):
         if self.ser:
@@ -439,55 +499,101 @@ class CNCSender(QtWidgets.QMainWindow):
 
     # ---------------- Status ----------------
     def parse_status(self, status):
+        # ---------------- Positions ----------------
         m_mpos = re.search(r"MPos:([-0-9.]+),([-0-9.]+),([-0-9.]+)", status)
-        m_wco  = re.search(r"WCO:([-0-9.]+),([-0-9.]+),([-0-9.]+)", status)
         m_wpos = re.search(r"WPos:([-0-9.]+),([-0-9.]+),([-0-9.]+)", status)
+        m_wco  = re.search(r"WCO:([-0-9.]+),([-0-9.]+),([-0-9.]+)", status)
 
-        if self.use_real_feedback:
-            if m_wpos:
-                x = float(m_wpos.group(1))
-                y = float(m_wpos.group(2))
-                self.tool_item.setData([x], [y])
-                return
-            if m_wco:
-                self.last_wco = (float(m_wco.group(1)), float(m_wco.group(2)))
-            if m_mpos and self.last_wco:
-                mx, my = float(m_mpos.group(1)), float(m_mpos.group(2))
-                ox, oy = self.last_wco
-                self.tool_item.setData([mx - ox], [my - oy])
-                return
-            if m_mpos and self.last_wco is None:
-                x = float(m_mpos.group(1))
-                y = float(m_mpos.group(2))
-                self.tool_item.setData([x], [y])
+        if m_wco:
+            self.last_wco = [
+                float(m_wco.group(1)),
+                float(m_wco.group(2)),
+                float(m_wco.group(3))
+            ]
+
+        x = y = z = 0.0
+
+        if m_wpos:
+            x, y, z = map(float, m_wpos.groups())
+        elif m_mpos and self.last_wco:
+            x = float(m_mpos.group(1)) - self.last_wco[0]
+            y = float(m_mpos.group(2)) - self.last_wco[1]
+            z = float(m_mpos.group(3)) - self.last_wco[2]
+        elif m_mpos:
+            x, y, z = map(float, m_mpos.groups())
+
+        self.tool_item.setData([x], [y])
+        self.dro_x.setText(f"X:{x:.3f}")
+        self.dro_y.setText(f"Y:{y:.3f}")
+
+        # ---------------- Machine state ----------------
+        m_state = re.match(r"<([^|,]+)", status)
+        state = m_state.group(1) if m_state else "Unknown"
+
+        # ---------------- Feed / Speed ----------------
+        # GRBL 1.1: FS:<feed>,<spindle>
+        m_fs = re.search(r"FS:([0-9.]+),([0-9.]+)", status)
+        if m_fs:
+            feed  = float(m_fs.group(1))
+            speed = float(m_fs.group(2))
+
+            self.feed_label.setText(f"F:{feed:.0f}")
+            self.speed_label.setText(f"S:{speed:.0f}")
+            return  # IMPORTANT: prevent F:/S: false matches
+
+        # GRBL 0.9 fallback (only if FS not present)
+        m_feed = re.search(r"\bF:([0-9.]+)", status)
+        if m_feed:
+            self.feed_label.setText(f"F:{float(m_feed.group(1)):.0f}")
+
+        m_speed = re.search(r"\bS:([0-9.]+)", status)
+        if m_speed:
+            self.speed_label.setText(f"S:{float(m_speed.group(1)):.0f}")
+
+
+
+
+
+
 
     def poll_status(self):
-        if not self.ser:
+        """
+        Continuously poll GRBL for status reports.
+        Non-blocking, works smoothly during fast jogging (GRBL 1.1+).
+        """
+        if not self.ser or not self.ser.is_open:
             return
+
         try:
-            sent = False
-            while not sent:
-                try:
-                    self.ser.write(b"?")
-                    sent = True
-                except serial.SerialTimeoutException:
-                    time.sleep(0.005)
-            resp = self.ser.readline().decode(errors="ignore").strip()
-            if resp.startswith("<"):
-                self.parse_status(resp)
+            # Send status request
+            try:
+                self.ser.write(b"?")
+            except serial.SerialTimeoutException:
+                return
+
+            # Read all available lines without blocking
+            while self.ser.in_waiting > 0:
+                line = self.ser.readline().decode(errors="ignore").strip()
+                if not line:
+                    continue
+                # Only parse status reports starting with '<'
+                if line.startswith("<"):
+                    self.parse_status(line)
         except serial.SerialException:
             self.log("Serial error during status poll")
 
     @QtCore.pyqtSlot(float, float, float)
     def update_tool_position(self, x, y, z):
         self.tool_item.setData([x], [y])
+        self.dro_x.setText(f"X: {x:.3f}")
+        self.dro_y.setText(f"Y: {y:.3f}")  
 
     @QtCore.pyqtSlot()
     def job_finished(self):
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         if self.ser:
-            self.status_timer.start(200)
+            self.status_timer.start(50) #milliseconds
         self.progress_bar.setValue(0)  # reset progress
         self.progress_timer.stop()  # stop updating ETA/run time
         
@@ -515,7 +621,6 @@ class CNCSender(QtWidgets.QMainWindow):
             self.eta_label.setText(f"ETA: {h:02}:{m:02}:{s:02}")
         else:
             self.eta_label.setText("ETA: calculating...")
-
 
     # ---------------- Plotting ----------------
     def plot_gcode(self):
@@ -564,6 +669,46 @@ class CNCSender(QtWidgets.QMainWindow):
         self.cut_path.setData(cut_x, cut_y)
         self.rapid_path.setData(rapid_x, rapid_y)
         
+    #------- Legend helper -------------------------
+    def _update_legend_pos(self):
+        vb = self.plot.getViewBox()
+        p = vb.mapToView(QtCore.QPointF(6, 6))
+        self.legend_proxy.setPos(p.x(), p.y())
+        
+    #====== Feeds And Speeds Visualiser Legenf===============           
+    def _build_visualiser_legend(self):
+        self.legend_widget = QtWidgets.QFrame(self.plot)
+        self.legend_widget.setStyleSheet("""
+            QFrame {
+                background-color: rgba(0, 0, 0, 50);
+                color: white;
+                border-radius: 4px;
+            }
+            QLabel {
+                font-family: Consolas;
+                font-size: 16pt;
+            }
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self.legend_widget)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(1)
+
+        self.dro_x = QtWidgets.QLabel("X:0.000")
+        self.dro_y = QtWidgets.QLabel("Y:0.000")
+        self.feed_label = QtWidgets.QLabel("F:0")
+        self.speed_label = QtWidgets.QLabel("S:0")
+
+        layout.addWidget(self.dro_x)
+        layout.addWidget(self.dro_y)
+        # layout.addSpacing(2)
+        layout.addWidget(self.feed_label)
+        layout.addWidget(self.speed_label)
+
+        self.legend_widget.adjustSize()
+        self.legend_widget.move(8, 8)
+        self.legend_widget.show()
+       
 #single ui state manager--------------------
     def update_jog_zero_state(self):
         enabled = self.ser is not None and (self.sender is None or not self.sender.isRunning())
@@ -576,16 +721,10 @@ class CNCSender(QtWidgets.QMainWindow):
         for btn in self.zero_buttons:
             btn.setEnabled(enabled)
 
-
-
-
-
-
     # ---------------- Utility ----------------
     def log(self, msg):
         self.log_box.append(msg)
         self.log_box.ensureCursorVisible()
-
 
 # -------------------- Run --------------------
 if __name__ == "__main__":
