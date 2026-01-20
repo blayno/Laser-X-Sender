@@ -168,7 +168,7 @@ class SenderThread(QtCore.QThread):
 class CNCSender(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Laser X sender V1.4")
+        self.setWindowTitle("Laser X sender V1.5")
         self.resize(1100, 700)
 
         self.ser = None
