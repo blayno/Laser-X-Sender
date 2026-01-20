@@ -17,6 +17,9 @@ class SenderThread(QtCore.QThread):
     progress_signal = QtCore.pyqtSignal(int)  # <-- progress signal
     feed_signal = QtCore.pyqtSignal(float)  # NEW
     speed_signal = QtCore.pyqtSignal(float) # NEW
+    status_signal = QtCore.pyqtSignal(float, float, float)
+    QUIET_STATUS = True
+
 
     RX_BUFFER = 128      # GRBL RX buffer size
     SAFETY = 10          # Safety margin to avoid overflow
@@ -70,10 +73,7 @@ class SenderThread(QtCore.QThread):
                 if m_speed:
                     self.speed_signal.emit(float(m_speed.group(1)))
 
-                # ---- Emit tool position (throttled) ----
-                if time.time() - last_update > 0.01:
-                    self.tool_signal.emit(x, y, z)
-                    last_update = time.time()
+
 
                 # ---- Send to GRBL ----
                 sent = False
@@ -96,13 +96,42 @@ class SenderThread(QtCore.QThread):
             # ---- Read response from GRBL ----
             try:
                 resp = self.ser.readline().decode(errors="ignore").strip()
-                if resp:
+                if not resp:
+                    pass
+
+                # ---- STATUS REPORT (silent) ----
+                elif resp.startswith("<"):
+                    m = re.search(
+                        r"MPos:([-0-9.]+),([-0-9.]+),([-0-9.]+)",
+                        resp
+                    )
+                    if m:
+                        x_rt, y_rt, z_rt = map(float, m.groups())
+                        self.status_signal.emit(x_rt, y_rt, z_rt)
+
+                # ---- PLANNER RESPONSES (logged) ----
+                elif resp.startswith("ok") or resp.startswith("error"):
                     self.log_signal.emit(f"<< {resp}")
-                    if resp.startswith("ok") or resp.startswith("error"):
-                        if in_flight:
-                            bytes_in_flight -= in_flight.pop(0)
+                    if in_flight:
+                        bytes_in_flight -= in_flight.pop(0)
+
+                # ---- EVERYTHING ELSE (optional log) ----
+                else:
+                    self.log_signal.emit(f"<< {resp}")
+
+
             except serial.SerialException:
                 self.log_signal.emit("Serial read error")
+                
+# ---- =============== Request realtime ?? status print in console(20 Hz)================ ----
+            if time.time() - last_update > 0.05:
+                try:
+                    self.ser.write(b"?")
+                except serial.SerialException:
+                    pass
+                last_update = time.time()
+
+
 
             if idx >= len(self.gcode_lines) and not in_flight:
                 break
@@ -110,7 +139,7 @@ class SenderThread(QtCore.QThread):
             time.sleep(0.001)
 
         # ---- Final update ----
-        self.tool_signal.emit(x, y, z)
+        
         self.progress_signal.emit(100)
         self.log_signal.emit("Job complete")
         self.done_signal.emit()
@@ -250,10 +279,10 @@ class CNCSender(QtWidgets.QMainWindow):
         self.jog_distance_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.jog_distance_slider.setMinimum(1)     # 0.1 mm
         self.jog_distance_slider.setMaximum(1000)  # 100.0 mm
-        self.jog_distance_slider.setValue(100)     # default 10 mm
+        self.jog_distance_slider.setValue(10)     # default 10 mm
         self.jog_distance_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
         self.jog_distance_slider.setTickInterval(50)
-        self.jog_distance_label = QtWidgets.QLabel("Distance: 10.0 mm")
+        self.jog_distance_label = QtWidgets.QLabel("Distance: 1.0 mm")
 
         self.jog_distance_slider.valueChanged.connect(
             lambda v: self.jog_distance_label.setText(f"Distance: {v / 10:.1f} mm")
@@ -263,10 +292,10 @@ class CNCSender(QtWidgets.QMainWindow):
         self.jog_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.jog_speed_slider.setMinimum(1)      # 1 mm/min
         self.jog_speed_slider.setMaximum(5000)   # 5000 mm/min
-        self.jog_speed_slider.setValue(500)      # default 500 mm/min
+        self.jog_speed_slider.setValue(1000)      # default 500 mm/min
         self.jog_speed_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
         self.jog_speed_slider.setTickInterval(500)
-        self.jog_speed_label = QtWidgets.QLabel("Speed: 500 mm/min")
+        self.jog_speed_label = QtWidgets.QLabel("Speed: 1000 mm/min")
 
         self.jog_speed_slider.valueChanged.connect(
             lambda v: self.jog_speed_label.setText(f"Speed: {v} mm/min")
@@ -277,8 +306,6 @@ class CNCSender(QtWidgets.QMainWindow):
         jog_settings_layout.addWidget(self.jog_distance_slider, 0, 1)
         jog_settings_layout.addWidget(self.jog_speed_label, 1, 0)
         jog_settings_layout.addWidget(self.jog_speed_slider, 1, 1)
-
-
 
         # --- Jog Buttons ---
         # left.addSpacing(10)
@@ -380,8 +407,6 @@ class CNCSender(QtWidgets.QMainWindow):
             self.log(f"Jog error: {e}")
 
 
-
-
     def zero_axis(self, axis):
         if not self.ser:
             return
@@ -465,18 +490,20 @@ class CNCSender(QtWidgets.QMainWindow):
     def play(self):
         if not self.gcode_lines:
             return
-        self.status_timer.stop()
+        
+        
         self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
         self.use_real_feedback = True
         self.sender = SenderThread(self.ser, self.gcode_lines)
         self.sender.log_signal.connect(self.log)
-        self.sender.tool_signal.connect(self.update_tool_position)
+
         self.sender.progress_signal.connect(self.progress_bar.setValue)  # <-- connect progress
         self.sender.done_signal.connect(self.job_finished)
         self.sender.feed_signal.connect(lambda f: self.feed_label.setText(f"F:{f:.0f}"))
         self.sender.speed_signal.connect(lambda s: self.speed_label.setText(f"S:{s:.0f}"))
+        self.sender.status_signal.connect(self.update_tool_position)
         self.sender.start()
         self.update_jog_zero_state()   # disable jog/zero
         
@@ -551,17 +578,16 @@ class CNCSender(QtWidgets.QMainWindow):
             self.speed_label.setText(f"S:{float(m_speed.group(1)):.0f}")
 
 
-
-
-
-
-
     def poll_status(self):
         """
         Continuously poll GRBL for status reports.
         Non-blocking, works smoothly during fast jogging (GRBL 1.1+).
         """
         if not self.ser or not self.ser.is_open:
+            return
+            
+        # 🚫 Do not poll while streaming
+        if self.sender and self.sender.isRunning():
             return
 
         try:
