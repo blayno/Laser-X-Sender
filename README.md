@@ -1,4 +1,4 @@
-![Screenshot](Assets/Capture.PNG)
+![Screenshot](Assets/Capture1.PNG)
 
 
 This is an experimental Gcode sender written mostly with Chat GPT 
